@@ -1,0 +1,100 @@
+name: Build llamafile
+
+on:
+    workflow_dispatch:
+        inputs:
+            model_url:
+                description: ""
+                required: true
+
+            huggingface_repo:
+                description: "HuggingFace repo to upload to. Example: rabil/llamafile. It is assumed that you have added your HuggingFace token with write access to your action secrets."
+                required: true
+
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Download Llamafile latest
+              run: |
+                  mkdir -p /usr/local/bin
+                  TAG=$(curl -s "https://api.github.com/repos/Mozilla-Ocho/llamafile/tags" | grep '"name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -n 1)
+                  LLAMAFILE_FILE_URL="https://github.com/Mozilla-Ocho/llamafile/releases/download/$TAG/llamafile-$TAG"
+                  ZIPALIGN_FILE_URL="https://github.com/Mozilla-Ocho/llamafile/releases/download/$TAG/zipalign-$TAG"
+                  LLAMAFILE_FILE="/usr/local/bin/llamafile"
+                  ZIPALIGN_FILE="/usr/local/bin/zipalign"
+                  
+                  wget -O "$LLAMAFILE_FILE" "$LLAMAFILE_FILE_URL"
+                  wget -O "$ZIPALIGN_FILE" "$ZIPALIGN_FILE_URL"
+                  chmod +x "$LLAMAFILE_FILE"
+                  chmod +x "$ZIPALIGN_FILE"
+                  
+                  mkdir -p llamafile
+
+            - uses: actions/checkout@v4
+              with:
+                path: "llamafile-builder"
+
+            # Add build cache
+            - uses: actions/cache@v3
+              with:
+                path: |
+                  ~/.cache/
+                key: ${{ runner.os }}-cache
+                restore-keys: |
+                  ${{ runner.os }}-
+
+            - name: llamafile gotchas error
+              run: |
+                sudo wget -O /usr/bin/ape https://cosmo.zip/pub/cosmos/bin/ape-$(uname -m).elf
+                sudo chmod +x /usr/bin/ape
+                sudo sh -c "echo ':APE:M::MZqFpD::/usr/bin/ape:' >/proc/sys/fs/binfmt_misc/register"
+                sudo sh -c "echo ':APE-jart:M::jartsr::/usr/bin/ape:' >/proc/sys/fs/binfmt_misc/register"
+
+            - name: Find model name
+              id: model_name
+              run: |
+                modeln=$(echo ${{ github.event.inputs.model_url }} | grep -o '[^/]*$' | sed 's/?download=true//')
+                echo "model=$modeln" >> $GITHUB_OUTPUT
+
+            - name: Download model
+              run: |
+                cd llamafile
+                wget -O ${{ steps.model_name.outputs.model }} ${{ github.event.inputs.model_url }}
+
+            - name: Create .args
+              run: |
+                cd llamafile
+                echo "-m" > .args
+                echo "${{ steps.model_name.outputs.model }}" >> .args
+                echo "--host" >> .args
+                echo "0.0.0.0" >> .args
+                echo "..." >> .args
+
+            - name: Prepare llamafile
+              run: |
+                # remove extension from model name
+                cd llamafile
+                file_ext_removed_model_name=$(echo ${{ steps.model_name.outputs.model }} | sed 's/\.[^.]*$//')
+                cp /usr/local/bin/llamafile "$file_ext_removed_model_name".llamafile
+                zipalign -j0 "$file_ext_removed_model_name".llamafile ${{ steps.model_name.outputs.model }} .args
+
+            - name: Setup python
+              uses: actions/setup-python@v5
+              with:
+                python-version: "3.11"
+                cache: "pip"
+
+            - name: Install dependencies
+              run: |
+                python -m pip install huggingface_hub
+
+            - name: Upload to HuggingFace
+              env:
+                HF_TOKEN: ${{ secrets.HF_TOKEN }}
+              run: |
+                cp llamafile-builder/hf.py llamafile/hf.py
+                cd llamafile
+                file_ext_removed_model_name=$(echo ${{ steps.model_name.outputs.model }} | sed 's/\.[^.]*$//')
+                python3 hf.py ${{ github.event.inputs.model_url }}  ${{ github.event.inputs.huggingface_repo }} "$file_ext_removed_model_name".llamafile
